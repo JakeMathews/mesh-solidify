@@ -8,7 +8,9 @@ Pipeline:
      (robust to holes and overlapping shells; no hole patching)
   3. keep the largest connected solid, drop specks
   4. narrow-band signed distance (sign from winding number) for a smooth surface
-  5. marching cubes -> repair -> quadric decimation -> verify watertight/manifold
+  5. marching cubes -> repair
+  6. biharmonic fairing of hole-patch vertices (far from any input triangle) -> no terraces
+  7. quadric decimation -> verify watertight/manifold
 
 Usage:
   python solidify.py in.stl out.3mf --scale 0.1 --voxel 0.125 --min-feature 0
@@ -26,6 +28,8 @@ ap.add_argument("--voxel", type=float, default=0.125, help="grid size in print m
 ap.add_argument("--min-feature", type=float, default=0.0, help="optional outward offset in print mm (0=off)")
 ap.add_argument("--iso", type=float, default=0.5, help="winding-number threshold")
 ap.add_argument("--target-faces", type=int, default=400_000)
+ap.add_argument("--fair-tau", type=float, default=0.5, help="vertices farther than this many voxels from the input are hole patch (0=no fairing)")
+ap.add_argument("--fair-grow", type=int, default=2, help="extra rings around each patch to refair")
 a = ap.parse_args()
 T = time.time()
 log = lambda *s: print(f"[{time.time()-T:6.1f}s]", *s, flush=True)
@@ -77,6 +81,32 @@ ms = ml.MeshSet(); ms.add_mesh(ml.Mesh(v, f[:, ::-1]))
 ms.meshing_remove_duplicate_vertices(); ms.meshing_repair_non_manifold_edges(); ms.meshing_repair_non_manifold_vertices()
 ms.meshing_remove_connected_component_by_face_number(mincomponentsize=1000)
 log(f"marching cubes: {ms.current_mesh().face_number()} tris")
+
+# 6. fair hole patches: vertices far from every original triangle were invented to close a hole
+#    and carry voxel terraces. Re-solve them as a biharmonic (minimum-curvature-variation) surface
+#    with everything else held fixed, so they continue the curvature of the real surface around them.
+if a.fair_tau > 0:
+    cm = ms.current_mesh(); pv = cm.vertex_matrix().copy(); pf = cm.face_matrix().astype(np.int64)
+    dist = np.sqrt(igl.point_mesh_squared_distance(pv, V, F)[0])
+    free = dist > a.fair_tau * h
+    # grow by a couple of rings so the step at the patch rim is also refaired
+    import scipy.sparse as sp, scipy.sparse.linalg as spl
+    n = len(pv); e = np.r_[pf[:, [0, 1]], pf[:, [1, 2]], pf[:, [2, 0]]]
+    A = sp.coo_matrix((np.ones(len(e)), (e[:, 0], e[:, 1])), shape=(n, n)).tocsr(); A = ((A + A.T) > 0).astype(float)
+    for _ in range(a.fair_grow):
+        free = free | (A @ free.astype(float) > 0)
+    nf = int(free.sum())
+    if nf:
+        deg = np.asarray(A.sum(1)).ravel()
+        L = sp.eye(n) - sp.diags(1 / deg) @ A          # uniform Laplacian
+        Mb = (L.T @ L).tocsr()                          # bi-Laplacian (SPD restricted to free)
+        fi, ci = np.nonzero(free)[0], np.nonzero(~free)[0]
+        Mff = Mb[fi][:, fi].tocsc(); rhs = -(Mb[fi][:, ci] @ pv[ci])
+        solve = spl.factorized(Mff)
+        pv[fi] = np.column_stack([solve(rhs[:, k]) for k in range(3)])
+        ms = ml.MeshSet(); ms.add_mesh(ml.Mesh(pv, pf.astype(np.int32)))
+    log(f"faired {nf} hole-patch vertices ({100*nf/n:.1f}%)")
+
 if ms.current_mesh().face_number() > a.target_faces:
     ms.meshing_decimation_quadric_edge_collapse(targetfacenum=a.target_faces, preservetopology=True,
                                                 preserveboundary=True, qualitythr=0.3, planarquadric=True)
