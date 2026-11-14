@@ -4,11 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mesh-solidify"
-version = "0.1.0"
+version = "0.1.1"
 description = "Turn broken meshes (holes, open shells, self-intersections) into one watertight, printable solid."
 readme = "README.md"
 license = "MIT"
-license-files = ["LICENSE"]
 requires-python = ">=3.10"
 authors = [{ name = "Jake Mathews" }]
 keywords = ["mesh", "stl", "3d-printing", "watertight", "mesh-repair", "winding-number", "remesh"]

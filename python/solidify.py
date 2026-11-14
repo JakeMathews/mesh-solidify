@@ -38,7 +38,7 @@ import os
 import sys
 import time
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 DEFAULTS = dict(scale=1.0, voxel=0.125, min_feature=0.0, iso=0.5,
                 target_faces=400_000, fair_tau=0.5, fair_grow=2, max_voxels=400_000_000)
