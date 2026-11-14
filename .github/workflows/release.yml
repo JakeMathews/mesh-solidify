@@ -5,6 +5,14 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build and attach artifacts to
+        required: true
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
 
 permissions:
   contents: write
@@ -14,14 +22,16 @@ jobs:
     strategy:
       matrix:
         include:
-          - { os: macos-14, target: aarch64-apple-darwin, ext: "" }
-          - { os: macos-14, target: x86_64-apple-darwin, ext: "" }
+          - { os: macos-latest, target: aarch64-apple-darwin, ext: "" }
+          - { os: macos-latest, target: x86_64-apple-darwin, ext: "" }
           - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, ext: "" }
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, ext: "" }
           - { os: windows-latest, target: x86_64-pc-windows-msvc, ext: ".exe" }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -29,7 +39,7 @@ jobs:
       - name: Package
         shell: bash
         run: |
-          name=mesh-solidify-${GITHUB_REF_NAME}-${{ matrix.target }}
+          name=mesh-solidify-${TAG}-${{ matrix.target }}
           mkdir "$name"
           cp target/${{ matrix.target }}/release/mesh-solidify${{ matrix.ext }} README.md LICENSE "$name"/
           if [ "${{ runner.os }}" = "Windows" ]; then 7z a "$name.zip" "$name" >/dev/null; else tar czf "$name.tar.gz" "$name"; fi
@@ -42,6 +52,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
@@ -74,5 +86,5 @@ jobs:
         run: |
           cd out
           sha256sum * > SHA256SUMS.txt
-          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes "See CHANGELOG.md."
-          gh release upload "$GITHUB_REF_NAME" * --clobber
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --notes "See CHANGELOG.md."
+          gh release upload "$TAG" * --clobber
