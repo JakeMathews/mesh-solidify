@@ -298,15 +298,31 @@ pub fn solidify_with(
         origin: [lo[0] - pad * h, lo[1] - pad * h, lo[2] - pad * h],
         h,
     };
-    // A flat cut that lies on a layer of grid nodes has a distance of exactly 0 there, which
-    // makes slivers that cannot be simplified away: move the grid half a voxel off it.
+    // A flat face or cut that lies on a layer of grid nodes has a distance of exactly 0 there,
+    // which makes slivers that cannot be simplified away: move the grid off every such level
+    // (the input's own large axis-aligned faces, its flat bottom first among them, and the
+    // tools' planes), by the offset that keeps them all farthest from a layer.
     for k in 0..3 {
-        let on_node = tools.iter().flat_map(|t| t.levels(k)).any(|c| {
-            let f = ((c - g.origin[k]) / h).rem_euclid(1.0);
-            !(0.1..=0.9).contains(&f)
-        });
-        if on_node {
-            g.origin[k] -= 0.5 * h;
+        let mut levels: Vec<f64> = tools.iter().flat_map(|t| t.levels(k)).collect();
+        levels.extend(flat_levels(&m, k, 4.0 * h * h));
+        if levels.is_empty() {
+            continue;
+        }
+        let clear = |shift: f64| {
+            levels
+                .iter()
+                .map(|c| {
+                    let f = ((c - (g.origin[k] - shift * h)) / h).rem_euclid(1.0);
+                    f.min(1.0 - f)
+                })
+                .fold(f64::INFINITY, f64::min)
+        };
+        let best = [0.0, 0.5, 0.25, 0.75, 0.375, 0.625, 0.125, 0.875]
+            .into_iter()
+            .map(|s| (s, clear(s)))
+            .fold((0.0, -1.0), |a, b| if b.1 > a.1 + 1e-9 { b } else { a });
+        if best.0 > 0.0 {
+            g.origin[k] -= best.0 * h;
             g.n[k] += 1;
         }
     }
@@ -515,4 +531,37 @@ pub fn solidify_with(
         },
     };
     Ok((out, report))
+}
+
+/// The coordinates along axis `k` of the mesh's flat faces square to that axis, each of at
+/// least `min_area` (faces at the same level added up).
+fn flat_levels(m: &Mesh, k: usize, min_area: f64) -> Vec<f64> {
+    let (lo, hi) = m.bounds();
+    let tol = 1e-9 * (0..3).map(|i| hi[i] - lo[i]).fold(0.0, f64::max).max(1e-12);
+    let mut at: Vec<(f64, f64)> = Vec::new();
+    for t in &m.f {
+        let p = t.map(|i| m.v[i as usize]);
+        let c = p[0][k];
+        if (p[1][k] - c).abs() > tol || (p[2][k] - c).abs() > tol {
+            continue;
+        }
+        let n = crate::mesh::cross(sub(p[1], p[0]), sub(p[2], p[0]));
+        at.push((c, crate::mesh::norm(n) / 2.0));
+    }
+    at.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < at.len() {
+        let (c, mut a) = at[i];
+        let mut j = i + 1;
+        while j < at.len() && at[j].0 - c <= 1e3 * tol {
+            a += at[j].1;
+            j += 1;
+        }
+        if a >= min_area {
+            out.push(c);
+        }
+        i = j;
+    }
+    out
 }
