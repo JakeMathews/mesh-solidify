@@ -34,14 +34,16 @@ pub struct Bvh {
 pub(crate) type RawNode = (V3, f64, V3, u32, u32);
 
 impl Bvh {
-    /// The tree and its triangles in storage order, for the GPU copy.
+    /// The tree (dipoles, then boxes) and its triangles in storage order, for the GPU copy.
     #[cfg(feature = "gpu")]
-    pub(crate) fn raw(&self) -> (Vec<RawNode>, &[[V3; 3]]) {
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn raw(&self) -> (Vec<RawNode>, Vec<(V3, V3)>, &[[V3; 3]]) {
         (
             self.nodes
                 .iter()
                 .map(|n| (n.c, n.r, n.n, n.first, n.count))
                 .collect(),
+            self.nodes.iter().map(|n| (n.lo, n.hi)).collect(),
             &self.tris,
         )
     }

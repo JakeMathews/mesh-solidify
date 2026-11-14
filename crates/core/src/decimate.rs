@@ -372,6 +372,11 @@ pub fn decimate(
             vf[k as usize].push(i as u32);
         }
     }
+    let t0 = std::time::Instant::now();
+    let dbg = std::env::var_os("MESH_SOLIDIFY_DEBUG").is_some();
+    if dbg {
+        eprintln!("decimate: setup done");
+    }
     let lambda = 1e-3 * area_sum / m.f.len() as f64;
     let nf = m.f.len();
     let s = State {
@@ -397,7 +402,7 @@ pub fn decimate(
     // The sweeps run in parallel by region of space. A thread collapses an edge only when both
     // ends are in its region and so are all their neighbours, so no two threads touch the same
     // vertex or face. The regions move every sweep, so no edge stays on a border.
-    let switch = target.saturating_mul(2).max(target + 1000);
+    let switch = (target + target / 4).max(target + 1000);
     let mut rng = 0x9E37_79B9_7F4A_7C15u64;
     let mut next = || {
         rng ^= rng << 13;
@@ -514,6 +519,13 @@ pub fn decimate(
         if stop.load(Atomic::Relaxed) {
             return Err(());
         }
+        if dbg {
+            eprintln!(
+                "decimate: round {round} left {} at {:.2}s",
+                left(),
+                t0.elapsed().as_secs_f64()
+            );
+        }
         report(left());
         // A sweep that removes almost nothing twice in a row is as far as sweeps go.
         if left() * 100 > faces_left * 99 {
@@ -569,6 +581,9 @@ pub fn decimate(
         for &w in &around {
             s.push(&mut heap, u, w, &mut tu, &mut tv);
         }
+    }
+    if dbg {
+        eprintln!("decimate: heap done at {:.2}s", t0.elapsed().as_secs_f64());
     }
     let faces_left = left();
     let (faces, alive) = (s.faces.into_vec(), s.alive.into_vec());

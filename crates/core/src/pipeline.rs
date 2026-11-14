@@ -255,13 +255,18 @@ pub fn solidify(input: &Mesh, p: &Params, mon: &dyn Monitor) -> Result<(Mesh, Re
     #[allow(unused_mut)]
     let mut on_gpu: Option<(Vec<u8>, usize)> = None;
     #[cfg(feature = "gpu")]
+    let mut gpu: Option<crate::gpu::Winding> = None;
+    #[cfg(feature = "gpu")]
     if p.gpu {
         let centre = g.pos(dims[0] / 2, dims[1] / 2, dims[2] / 2);
         match crate::gpu::Winding::new(&bvh, 2.0, centre) {
             Ok(w) => {
-                mon.log(&format!("winding number on the GPU: {}", w.name));
+                mon.log(&format!("using the GPU: {}", w.name));
                 match grid::inside_mask_gpu(&bvh, &w, &g, p.iso, 0.5 * h, &scaled) {
-                    Ok(r) => on_gpu = Some(r),
+                    Ok(r) => {
+                        on_gpu = Some(r);
+                        gpu = Some(w);
+                    }
                     Err(grid::GpuStop::Cancelled) => return Err(Error::Cancelled),
                     Err(grid::GpuStop::Failed(e)) => {
                         mon.log(&format!("the GPU pass failed ({e}); using the CPU"))
@@ -296,7 +301,18 @@ pub fn solidify(input: &Mesh, p: &Params, mon: &dyn Monitor) -> Result<(Mesh, Re
 
     let far = (k_band + 1) as f64 * h;
     let bar = next();
-    let field = contour::field(&bvh, &g, &mask, far, p.min_feature, &bar);
+    let field = contour::field(
+        &bvh,
+        &g,
+        &mask,
+        far,
+        p.min_feature,
+        #[cfg(feature = "gpu")]
+        gpu.as_ref(),
+        &bar,
+    );
+    #[cfg(feature = "gpu")]
+    drop(gpu);
     let bar = next();
     let mut out = contour::march(&field, &bar);
     drop(field);

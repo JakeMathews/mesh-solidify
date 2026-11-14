@@ -119,56 +119,74 @@ pub fn fair(
     for (l, &g) in order.iter().enumerate() {
         local[g as usize] = l as u32;
     }
-    let nbr: Vec<Vec<u32>> = order[..nkr]
-        .iter()
-        .map(|&g| {
-            adj.of(g as usize)
-                .iter()
-                .map(|&j| local[j as usize])
-                .collect()
-        })
-        .collect();
+    // Neighbours in local numbering, compressed.
+    let mut nstart = Vec::with_capacity(nkr + 1);
+    let mut nlist: Vec<u32> = Vec::new();
+    nstart.push(0u32);
+    for &g in &order[..nkr] {
+        nlist.extend(adj.of(g as usize).iter().map(|&j| local[j as usize]));
+        nstart.push(nlist.len() as u32);
+    }
+    let nbr = |i: usize| &nlist[nstart[i] as usize..nstart[i + 1] as usize];
     let n = order.len();
     let x0: Vec<[f64; 3]> = order.iter().map(|&g| m.v[g as usize]).collect();
 
-    // K x over the first `nkr` local vertices, for x given on all `n`; neighbours outside the
-    // work set never occur for these vertices.
-    let lap = |x: &[[f64; 3]], upto: usize| -> Vec<[f64; 3]> {
-        par::map(upto, |i| {
-            let l = &nbr[i];
-            let d = l.len() as f64;
-            let mut s = [d * x[i][0], d * x[i][1], d * x[i][2]];
-            for &j in l {
-                let xj = x[j as usize];
-                s[0] -= xj[0];
-                s[1] -= xj[1];
-                s[2] -= xj[2];
+    const C: usize = 1 << 14;
+    // out[i] = (K x)[i] for i < out.len(), for x given on all `n`; neighbours outside the work
+    // set never occur for these vertices.
+    let lap = |x: &[[f64; 3]], out: &mut [[f64; 3]]| {
+        par::chunks_mut(out, C, |ci, chunk| {
+            for (j, o) in chunk.iter_mut().enumerate() {
+                let i = ci * C + j;
+                let l = nbr(i);
+                let d = l.len() as f64;
+                let mut s = [d * x[i][0], d * x[i][1], d * x[i][2]];
+                for &j in l {
+                    let xj = x[j as usize];
+                    s[0] -= xj[0];
+                    s[1] -= xj[1];
+                    s[2] -= xj[2];
+                }
+                *o = s;
+            }
+        });
+    };
+    // out = K x (membrane) or K K x (thin plate) on the free vertices; `tmp` is scratch.
+    let apply = |x: &[[f64; 3]], tmp: &mut [[f64; 3]], out: &mut [[f64; 3]]| {
+        if flat {
+            lap(x, out);
+        } else {
+            lap(x, &mut tmp[..nkr]);
+            lap(tmp, out);
+        }
+    };
+    // Chunked so the sums come out the same on every run.
+    let dot3 = |a: &[[f64; 3]], b: &[[f64; 3]]| -> [f64; 3] {
+        let len = a.len().min(b.len());
+        let parts = par::map(len.div_ceil(C), |ci| {
+            let mut s = [0.0; 3];
+            for i in ci * C..((ci + 1) * C).min(len) {
+                for k in 0..3 {
+                    s[k] += a[i][k] * b[i][k];
+                }
             }
             s
-        })
-    };
-    // M p = K p (membrane) or K K p (thin plate) on free vertices, p zero outside them.
-    let apply = |p: &[[f64; 3]]| -> Vec<[f64; 3]> {
-        let mut full = vec![[0.0; 3]; n];
-        full[..nfree].copy_from_slice(p);
-        if flat {
-            return lap(&full, nfree);
+        });
+        let mut s = [0.0; 3];
+        for q in parts {
+            for k in 0..3 {
+                s[k] += q[k];
+            }
         }
-        let mut y = lap(&full, nkr);
-        y.resize(n, [0.0; 3]);
-        lap(&y, nfree)
+        s
     };
-    let kx0 = if flat {
-        lap(&x0, nfree)
-    } else {
-        let mut y0 = lap(&x0, nkr);
-        y0.resize(n, [0.0; 3]);
-        lap(&y0, nfree)
-    };
-    let b: Vec<[f64; 3]> = kx0.iter().map(|v| [-v[0], -v[1], -v[2]]).collect();
+    let mut tmp = vec![[0.0; 3]; n];
+    let mut ap = vec![[0.0; 3]; nfree];
+    apply(&x0, &mut tmp, &mut ap);
+    let b: Vec<[f64; 3]> = ap.iter().map(|v| [-v[0], -v[1], -v[2]]).collect();
     let dinv: Vec<f64> = (0..nfree)
         .map(|i| {
-            let d = nbr[i].len() as f64;
+            let d = nbr(i).len() as f64;
             if flat {
                 1.0 / d
             } else {
@@ -177,43 +195,43 @@ pub fn fair(
         })
         .collect();
 
-    // Preconditioned conjugate gradient, three right-hand sides at once.
+    // Preconditioned conjugate gradient, three right-hand sides at once. `p` spans the whole
+    // work set and stays zero outside the free vertices.
     let mut x = vec![[0.0; 3]; nfree];
     let mut r = b.clone();
-    let mut z: Vec<[f64; 3]> = (0..nfree)
-        .map(|i| [r[i][0] * dinv[i], r[i][1] * dinv[i], r[i][2] * dinv[i]])
-        .collect();
-    let mut p = z.clone();
-    let dot3 = |a: &[[f64; 3]], b: &[[f64; 3]]| -> [f64; 3] {
-        let mut s = [0.0; 3];
-        for (u, v) in a.iter().zip(b) {
-            for k in 0..3 {
-                s[k] += u[k] * v[k];
-            }
-        }
-        s
-    };
+    let mut p = vec![[0.0; 3]; n];
+    for i in 0..nfree {
+        p[i] = [r[i][0] * dinv[i], r[i][1] * dinv[i], r[i][2] * dinv[i]];
+    }
     let bnorm = dot3(&b, &b);
-    let mut rz = dot3(&r, &z);
+    let mut rz = dot3(&r, &p);
     let goal = 1e-10f64.ln();
+    let debug = std::env::var_os("MESH_SOLIDIFY_DEBUG").is_some();
     // The residual isn't monotonic; the bar is.
     let mut shown = 0.0f64;
     for it in 0..max_iter {
-        let ap = apply(&p);
+        apply(&p, &mut tmp, &mut ap);
         let pap = dot3(&p, &ap);
         let mut alpha = [0.0; 3];
         for k in 0..3 {
             alpha[k] = if pap[k] > 0.0 { rz[k] / pap[k] } else { 0.0 };
         }
-        for i in 0..nfree {
-            for k in 0..3 {
-                x[i][k] += alpha[k] * p[i][k];
-                r[i][k] -= alpha[k] * ap[i][k];
+        par::chunks_mut(&mut x, C, |ci, chunk| {
+            for (j, v) in chunk.iter_mut().enumerate() {
+                for k in 0..3 {
+                    v[k] += alpha[k] * p[ci * C + j][k];
+                }
             }
-        }
+        });
+        par::chunks_mut(&mut r, C, |ci, chunk| {
+            for (j, v) in chunk.iter_mut().enumerate() {
+                for k in 0..3 {
+                    v[k] -= alpha[k] * ap[ci * C + j][k];
+                }
+            }
+        });
         let rr = dot3(&r, &r);
-        if std::env::var_os("MESH_SOLIDIFY_DEBUG").is_some() && (it % 50 == 0 || it + 1 == max_iter)
-        {
+        if debug && (it % 50 == 0 || it + 1 == max_iter) {
             eprintln!(
                 "fair it {it}: residual {:.2e} (free {nfree})",
                 (0..3)
@@ -229,18 +247,34 @@ pub fn fair(
             .fold(f64::INFINITY, f64::min);
         shown = shown.max((it as f64 / max_iter as f64).max(reached).clamp(0.0, 1.0));
         progress(shown as f32);
-        for i in 0..nfree {
+        // r . z with z = r / diag, then p = z + beta p.
+        let parts = par::map(nfree.div_ceil(C), |ci| {
+            let mut s = [0.0; 3];
+            for i in ci * C..((ci + 1) * C).min(nfree) {
+                for k in 0..3 {
+                    s[k] += r[i][k] * r[i][k] * dinv[i];
+                }
+            }
+            s
+        });
+        let mut rz_new = [0.0; 3];
+        for q in parts {
             for k in 0..3 {
-                z[i][k] = r[i][k] * dinv[i];
+                rz_new[k] += q[k];
             }
         }
-        let rz_new = dot3(&r, &z);
+        let mut beta = [0.0; 3];
         for k in 0..3 {
-            let beta = if rz[k] > 0.0 { rz_new[k] / rz[k] } else { 0.0 };
-            for i in 0..nfree {
-                p[i][k] = z[i][k] + beta * p[i][k];
-            }
+            beta[k] = if rz[k] > 0.0 { rz_new[k] / rz[k] } else { 0.0 };
         }
+        par::chunks_mut(&mut p[..nfree], C, |ci, chunk| {
+            for (j, v) in chunk.iter_mut().enumerate() {
+                let i = ci * C + j;
+                for k in 0..3 {
+                    v[k] = r[i][k] * dinv[i] + beta[k] * v[k];
+                }
+            }
+        });
         rz = rz_new;
     }
     for i in 0..nfree {

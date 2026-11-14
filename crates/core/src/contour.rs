@@ -64,6 +64,7 @@ pub fn field<'a>(
     mask: &'a [u8],
     far: f64,
     offset: f64,
+    #[cfg(feature = "gpu")] gpu: Option<&crate::gpu::Winding>,
     progress: &(dyn Fn(f32) + Sync),
 ) -> Field<'a> {
     let nb = [g.n[0].div_ceil(S), g.n[1].div_ceil(S), g.n[2].div_ceil(S)];
@@ -107,32 +108,69 @@ pub fn field<'a>(
     let tiny = (1e-6 * g.h) as f32;
     let mut pool = vec![0f32; ids.len() * S * S * S];
     let done = AtomicUsize::new(0);
-    let every = (ids.len() / 200).max(1);
-    par::chunks_mut(&mut pool, S * S * S, |s, chunk| {
-        let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-        if d % every == 0 {
-            progress(d as f32 / ids.len() as f32);
+    // Signed and offset value of a node from its distance to the input.
+    let value = |inside: bool, d: f64| {
+        let mut f = (if inside { -d } else { d } - offset) as f32;
+        if f.abs() < tiny {
+            f = if inside { -tiny } else { tiny };
         }
-        let b = ids[s];
+        f
+    };
+    let node = |b: usize, c: usize| {
         let (bi, bj, bk) = (b % nb[0], (b / nb[0]) % nb[1], b / (nb[0] * nb[1]));
-        for k in 0..S {
-            for j in 0..S {
-                for i in 0..S {
-                    let (gi, gj, gk) = (bi * S + i, bj * S + j, bk * S + k);
-                    if gi >= g.n[0] || gj >= g.n[1] || gk >= g.n[2] {
-                        continue;
-                    }
-                    let inside = mask[g.idx(gi, gj, gk)] != 0;
-                    let d = bvh.dist2(g.pos(gi, gj, gk), far * far).sqrt();
-                    let mut f = (if inside { -d } else { d } - offset) as f32;
-                    if f.abs() < tiny {
-                        f = if inside { -tiny } else { tiny };
-                    }
-                    chunk[i + S * (j + S * k)] = f;
+        (bi * S + c % S, bj * S + (c / S) % S, bk * S + c / (S * S))
+    };
+    let within = |(i, j, k): (usize, usize, usize)| i < g.n[0] && j < g.n[1] && k < g.n[2];
+
+    // On the GPU: the stored blocks in groups of one batch of points.
+    #[cfg(feature = "gpu")]
+    let on_gpu = gpu.is_some_and(|gpu| {
+        const GROUP: usize = crate::gpu::BATCH / (S * S * S);
+        let failed = std::sync::atomic::AtomicBool::new(false);
+        let groups = ids.len().div_ceil(GROUP);
+        par::chunks_mut(&mut pool, GROUP * S * S * S, |gi, chunk| {
+            if failed.load(Ordering::Relaxed) {
+                return;
+            }
+            let mut pts = Vec::with_capacity(chunk.len());
+            for c in 0..chunk.len() {
+                let (i, j, k) = node(ids[gi * GROUP + c / (S * S * S)], c % (S * S * S));
+                pts.push(g.pos(i, j, k));
+            }
+            let mut d = Vec::with_capacity(chunk.len());
+            if gpu.dist(&pts, far, &mut d).is_err() {
+                failed.store(true, Ordering::Relaxed);
+                return;
+            }
+            for (c, out) in chunk.iter_mut().enumerate() {
+                let n = node(ids[gi * GROUP + c / (S * S * S)], c % (S * S * S));
+                if within(n) {
+                    *out = value(mask[g.idx(n.0, n.1, n.2)] != 0, d[c] as f64);
                 }
             }
-        }
+            progress((done.fetch_add(1, Ordering::Relaxed) + 1) as f32 / groups as f32);
+        });
+        !failed.load(Ordering::Relaxed)
     });
+    #[cfg(not(feature = "gpu"))]
+    let on_gpu = false;
+
+    if !on_gpu {
+        let every = (ids.len() / 200).max(1);
+        par::chunks_mut(&mut pool, S * S * S, |s, chunk| {
+            let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+            if d % every == 0 {
+                progress(d as f32 / ids.len() as f32);
+            }
+            for (c, out) in chunk.iter_mut().enumerate() {
+                let n = node(ids[s], c);
+                if within(n) {
+                    let d = bvh.dist2(g.pos(n.0, n.1, n.2), far * far).sqrt();
+                    *out = value(mask[g.idx(n.0, n.1, n.2)] != 0, d);
+                }
+            }
+        });
+    }
     Field {
         g: *g,
         mask,
@@ -155,18 +193,67 @@ const TETS: [[u8; 4]; 6] = [
 ];
 
 /// Contour the zero level of `f` (outward = positive side).
-pub fn march(f: &Field, progress: &dyn Fn(f32)) -> Mesh {
-    let g = &f.g;
-    let mut mesh = Mesh::default();
-    let mut verts: FxMap<u64, u32> = FxMap::default();
+///
+/// Blocks are contoured in parallel in groups, each with its own vertices; the vertices are
+/// then merged by the grid edge they sit on.
+pub fn march(f: &Field, progress: &(dyn Fn(f32) + Sync)) -> Mesh {
     let blocks: Vec<usize> = (0..f.slot.len())
         .filter(|&b| f.slot[b] != u32::MAX)
         .collect();
-    let every = (blocks.len() / 200).max(1);
-    for (n, &b) in blocks.iter().enumerate() {
-        if n % every == 0 {
-            progress(n as f32 / blocks.len() as f32);
+    const GROUP: usize = 128;
+    let ngroups = blocks.len().div_ceil(GROUP);
+    let done = AtomicUsize::new(0);
+    let every = (ngroups / 200).max(1);
+    let parts: Vec<(Vec<u64>, Mesh)> = par::map(ngroups, |gi| {
+        let part = march_blocks(f, &blocks[gi * GROUP..((gi + 1) * GROUP).min(blocks.len())]);
+        let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+        if d % every == 0 {
+            progress(0.8 * d as f32 / ngroups as f32);
         }
+        part
+    });
+    // Merge: sort every part's vertices by edge key; equal keys are one vertex.
+    let total: usize = parts.iter().map(|p| p.0.len()).sum();
+    let mut all: Vec<(u64, u32, u32)> = Vec::with_capacity(total);
+    for (gi, (keys, _)) in parts.iter().enumerate() {
+        all.extend(
+            keys.iter()
+                .enumerate()
+                .map(|(l, &k)| (k, gi as u32, l as u32)),
+        );
+    }
+    par::sort_unstable(&mut all);
+    let mut mesh = Mesh::default();
+    let mut remap: Vec<Vec<u32>> = parts.iter().map(|p| vec![0u32; p.0.len()]).collect();
+    let mut last = u64::MAX;
+    for &(k, gi, l) in &all {
+        if k != last || mesh.v.is_empty() {
+            mesh.v.push(parts[gi as usize].1.v[l as usize]);
+            last = k;
+        }
+        remap[gi as usize][l as usize] = (mesh.v.len() - 1) as u32;
+    }
+    drop(all);
+    progress(0.9);
+    mesh.f.reserve(parts.iter().map(|p| p.1.f.len()).sum());
+    for (gi, (_, part)) in parts.iter().enumerate() {
+        let r = &remap[gi];
+        mesh.f.extend(
+            part.f
+                .iter()
+                .map(|t| [r[t[0] as usize], r[t[1] as usize], r[t[2] as usize]]),
+        );
+    }
+    mesh
+}
+
+/// Contour some blocks: the mesh, and for each of its vertices the key of its grid edge.
+fn march_blocks(f: &Field, blocks: &[usize]) -> (Vec<u64>, Mesh) {
+    let g = &f.g;
+    let mut mesh = Mesh::default();
+    let mut keys: Vec<u64> = Vec::new();
+    let mut verts: FxMap<u64, u32> = FxMap::default();
+    for &b in blocks {
         let nb = f.nb;
         let (bi, bj, bk) = (b % nb[0], (b / nb[0]) % nb[1], b / (nb[0] * nb[1]));
         for k in bk * S..((bk + 1) * S).min(g.n[2] - 1) {
@@ -196,6 +283,7 @@ pub fn march(f: &Field, progress: &dyn Fn(f32)) -> Mesh {
                         );
                         let key = node as u64 * 8 + (hi ^ lo) as u64;
                         *verts.entry(key).or_insert_with(|| {
+                            keys.push(key);
                             let (fa, fb) = (v[lo as usize] as f64, v[hi as usize] as f64);
                             let t = (fa / (fa - fb)).clamp(0.01, 0.99);
                             let (pa, pb) = (corner(lo), corner(hi));
@@ -266,5 +354,5 @@ pub fn march(f: &Field, progress: &dyn Fn(f32)) -> Mesh {
             }
         }
     }
-    mesh
+    (keys, mesh)
 }

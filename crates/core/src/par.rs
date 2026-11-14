@@ -36,3 +36,14 @@ pub fn each(n: usize, f: impl Fn(usize) + Sync + Send) {
 pub fn each(n: usize, f: impl Fn(usize) + Sync + Send) {
     (0..n).for_each(f);
 }
+
+#[cfg(feature = "parallel")]
+pub fn sort_unstable<T: Ord + Send>(v: &mut [T]) {
+    use rayon::prelude::*;
+    v.par_sort_unstable();
+}
+
+#[cfg(not(feature = "parallel"))]
+pub fn sort_unstable<T: Ord + Send>(v: &mut [T]) {
+    v.sort_unstable();
+}

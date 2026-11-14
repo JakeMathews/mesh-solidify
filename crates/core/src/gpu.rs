@@ -81,6 +81,123 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
+/// Distance to the nearest triangle, capped at sqrt(params.far2): the tree walk of
+/// [`Bvh::dist2`](crate::bvh::Bvh::dist2), nearer child first.
+const DIST_SHADER: &str = r#"
+struct Node {
+    lo: vec3<f32>,
+    first: u32,
+    hi: vec3<f32>,
+    count: u32,
+}
+struct Params {
+    count: u32,
+    far2: f32,
+    p1: u32,
+    p2: u32,
+}
+@group(0) @binding(0) var<storage, read> nodes: array<Node>;
+@group(0) @binding(1) var<storage, read> tris: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> points: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read_write> result: array<f32>;
+@group(0) @binding(4) var<uniform> params: Params;
+
+fn box_d2(n: u32, q: vec3<f32>) -> f32 {
+    let e = max(max(nodes[n].lo - q, vec3<f32>(0.0)), q - nodes[n].hi);
+    return dot(e, e);
+}
+
+// Ericson, Real-Time Collision Detection 5.1.5.
+fn tri_d2(t: u32, p: vec3<f32>) -> f32 {
+    let a = tris[3u * t].xyz;
+    let b = tris[3u * t + 1u].xyz;
+    let c = tris[3u * t + 2u].xyz;
+    let ab = b - a;
+    let ac = c - a;
+    let ap = p - a;
+    let d1 = dot(ab, ap);
+    let d2 = dot(ac, ap);
+    if (d1 <= 0.0 && d2 <= 0.0) { return dot(ap, ap); }
+    let bp = p - b;
+    let d3 = dot(ab, bp);
+    let d4 = dot(ac, bp);
+    if (d3 >= 0.0 && d4 <= d3) { return dot(bp, bp); }
+    let vc = d1 * d4 - d3 * d2;
+    if (vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0) {
+        let x = ap - ab * (d1 / (d1 - d3));
+        return dot(x, x);
+    }
+    let cp = p - c;
+    let d5 = dot(ab, cp);
+    let d6 = dot(ac, cp);
+    if (d6 >= 0.0 && d5 <= d6) { return dot(cp, cp); }
+    let vb = d5 * d2 - d1 * d6;
+    if (vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0) {
+        let x = ap - ac * (d2 / (d2 - d6));
+        return dot(x, x);
+    }
+    let va = d3 * d6 - d5 * d4;
+    if (va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0) {
+        let w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        let x = bp - (c - b) * w;
+        return dot(x, x);
+    }
+    let n = cross(ab, ac);
+    let nn = dot(n, n);
+    if (nn <= 0.0) { return dot(ap, ap); }
+    let h = dot(ap, n);
+    return h * h / nn;
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x;
+    if (i >= params.count) {
+        return;
+    }
+    let q = points[i].xyz;
+    var best = params.far2;
+    var stack: array<u32, 64>;
+    var sp = 1;
+    stack[0] = 0u;
+    while (sp > 0) {
+        sp -= 1;
+        let n = stack[sp];
+        if (box_d2(n, q) >= best) {
+            continue;
+        }
+        let count = nodes[n].count;
+        let first = nodes[n].first;
+        if (count > 0u) {
+            for (var t = first; t < first + count; t += 1u) {
+                best = min(best, tri_d2(t, q));
+            }
+        } else if (sp < 62) {
+            let da = box_d2(first, q);
+            let db = box_d2(first + 1u, q);
+            if (da <= db) {
+                stack[sp] = first + 1u;
+                stack[sp + 1] = first;
+            } else {
+                stack[sp] = first;
+                stack[sp + 1] = first + 1u;
+            }
+            sp += 2;
+        }
+    }
+    result[i] = sqrt(best);
+}
+"#;
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct BoxNode {
+    lo: [f32; 3],
+    first: u32,
+    hi: [f32; 3],
+    count: u32,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GpuNode {
@@ -100,15 +217,21 @@ struct Set {
     bind: wgpu::BindGroup,
 }
 
+/// One compute kernel over the tree: its pipeline, its copy of the nodes and its buffer sets.
+struct Kernel {
+    pipeline: wgpu::ComputePipeline,
+    nodes: wgpu::Buffer,
+    pool: Mutex<Vec<Set>>,
+}
+
 pub struct Winding {
     device: wgpu::Device,
     queue: wgpu::Queue,
-    pipeline: wgpu::ComputePipeline,
-    nodes: wgpu::Buffer,
+    winding: Kernel,
+    dist: Kernel,
     tris: wgpu::Buffer,
     /// Positions are sent relative to this point, to keep single precision where it matters.
     centre: V3,
-    pool: Mutex<Vec<Set>>,
     pub name: String,
 }
 
@@ -133,7 +256,7 @@ impl Winding {
         }))
         .map_err(|e| e.to_string())?;
 
-        let (bn, bt) = bvh.raw();
+        let (bn, bx, bt) = bvh.raw();
         let rel = |p: V3| {
             [
                 (p[0] - centre[0]) as f32,
@@ -152,6 +275,21 @@ impl Winding {
                 pad: [0; 3],
             })
             .collect();
+        // Boxes are rounded outward so a point is never nearer to a triangle than to its box.
+        let boxes: Vec<BoxNode> = bx
+            .iter()
+            .zip(&bn)
+            .map(|((lo, hi), n)| {
+                let (l, h) = (rel(*lo), rel(*hi));
+                let pad = |x: f32| x.abs() * 4.0 * f32::EPSILON + f32::MIN_POSITIVE;
+                BoxNode {
+                    lo: [l[0] - pad(l[0]), l[1] - pad(l[1]), l[2] - pad(l[2])],
+                    first: n.3,
+                    hi: [h[0] + pad(h[0]), h[1] + pad(h[1]), h[2] + pad(h[2])],
+                    count: n.4,
+                }
+            })
+            .collect();
         let mut tris: Vec<[f32; 4]> = Vec::with_capacity(bt.len() * 3);
         for t in bt {
             for p in t {
@@ -166,6 +304,7 @@ impl Winding {
             .max_storage_buffer_binding_size
             .min(limits.max_buffer_size as _) as u64;
         let (nb, tb): (&[u8], &[u8]) = (bytemuck::cast_slice(&nodes), bytemuck::cast_slice(&tris));
+        let xb: &[u8] = bytemuck::cast_slice(&boxes);
         if nb.len() as u64 > max || tb.len() as u64 > max {
             return Err(format!(
                 "the mesh needs {} MB on the GPU, more than its {} MB per buffer",
@@ -183,34 +322,41 @@ impl Winding {
             queue.write_buffer(&b, 0, bytes);
             b
         };
-        let nodes = upload("nodes", nb);
         let tris = upload("tris", tb);
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("winding"),
-            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
-        });
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("winding"),
-            layout: None,
-            module: &module,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+        let kernel = |label, source: &str, nodes: wgpu::Buffer| {
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(label),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            });
+            let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout: None,
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+            Kernel {
+                pipeline,
+                nodes,
+                pool: Mutex::new(Vec::new()),
+            }
+        };
+        let winding = kernel("winding", SHADER, upload("nodes", nb));
+        let dist = kernel("distance", DIST_SHADER, upload("boxes", xb));
         Ok(Winding {
             device,
             queue,
-            pipeline,
-            nodes,
+            winding,
+            dist,
             tris,
             centre,
-            pool: Mutex::new(Vec::new()),
             name: format!("{} ({:?})", info.name, info.backend),
         })
     }
 
-    fn set(&self) -> Set {
-        if let Some(s) = self.pool.lock().unwrap().pop() {
+    fn set(&self, kernel: &Kernel) -> Set {
+        if let Some(s) = kernel.pool.lock().unwrap().pop() {
             return s;
         }
         let buf = |label, size: usize, usage| {
@@ -234,9 +380,9 @@ impl Winding {
         }
         let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
-            layout: &self.pipeline.get_bind_group_layout(0),
+            layout: &kernel.pipeline.get_bind_group_layout(0),
             entries: &[
-                entry(0, &self.nodes),
+                entry(0, &kernel.nodes),
                 entry(1, &self.tris),
                 entry(2, &points),
                 entry(3, &result),
@@ -254,6 +400,15 @@ impl Winding {
 
     /// Winding numbers at `pts`, appended to `out`. Blocks; callable from many threads.
     pub fn eval(&self, pts: &[V3], out: &mut Vec<f32>) -> Result<(), String> {
+        self.run(&self.winding, 0.0, pts, out)
+    }
+
+    /// Distances from `pts` to the nearest triangle, at most `far`, appended to `out`.
+    pub fn dist(&self, pts: &[V3], far: f64, out: &mut Vec<f32>) -> Result<(), String> {
+        self.run(&self.dist, (far * far) as f32, pts, out)
+    }
+
+    fn run(&self, kernel: &Kernel, arg: f32, pts: &[V3], out: &mut Vec<f32>) -> Result<(), String> {
         let mut staged: Vec<[f32; 4]> = Vec::with_capacity(pts.len().min(BATCH));
         for chunk in pts.chunks(BATCH) {
             staged.clear();
@@ -266,17 +421,20 @@ impl Winding {
                 ]
             }));
             let n = chunk.len();
-            let s = self.set();
+            let s = self.set(kernel);
             self.queue
                 .write_buffer(&s.points, 0, bytemuck::cast_slice(&staged));
-            self.queue
-                .write_buffer(&s.params, 0, bytemuck::cast_slice(&[n as u32, 0, 0, 0]));
+            self.queue.write_buffer(
+                &s.params,
+                0,
+                bytemuck::cast_slice(&[n as u32, arg.to_bits(), 0, 0]),
+            );
             let mut enc = self
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
             {
                 let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
-                pass.set_pipeline(&self.pipeline);
+                pass.set_pipeline(&kernel.pipeline);
                 pass.set_bind_group(0, &s.bind, &[]);
                 pass.dispatch_workgroups(n.div_ceil(64) as u32, 1, 1);
             }
@@ -319,7 +477,7 @@ impl Winding {
                 out.extend_from_slice(bytemuck::cast_slice(&view));
             }
             s.read.unmap();
-            self.pool.lock().unwrap().push(s);
+            kernel.pool.lock().unwrap().push(s);
         }
         Ok(())
     }
