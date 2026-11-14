@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -52,7 +53,14 @@ def _num(kind, lo=None, hi=None, lo_open=False, hi_open=False):
         try:
             x = kind(s)
         except ValueError:
-            raise argparse.ArgumentTypeError(f"{s!r} is not a valid {kind.__name__}")
+            # let ints be written as 4e8 or 400_000_000.0
+            try:
+                f = float(s)
+            except ValueError:
+                f = None
+            if kind is not int or f is None or not f.is_integer():
+                raise argparse.ArgumentTypeError(f"{s!r} is not a valid {kind.__name__}")
+            x = int(f)
         if x != x or x in (float("inf"), float("-inf")):
             raise argparse.ArgumentTypeError(f"{s!r} must be finite")
         if lo is not None and (x <= lo if lo_open else x < lo):
@@ -196,7 +204,8 @@ def solidify(src, dst, *, scale=1.0, voxel=0.125, min_feature=0.0, iso=0.5, targ
     dims = np.ceil((V.max(0) + pad * h - lo) / h).astype(int) + 1
     nvox = int(dims.prod())
     if nvox > max_voxels:
-        suggest = voxel * (nvox / max_voxels) ** (1 / 3)
+        # round up (and allow for padding) so the suggestion actually fits
+        suggest = math.ceil(voxel * (nvox / max_voxels) ** (1 / 3) * 1.02 * 1000) / 1000
         raise GridTooLarge(f"grid {dims.tolist()} = {nvox/1e6:.0f}M voxels exceeds --max-voxels "
                            f"{max_voxels/1e6:.0f}M; use --voxel {suggest:.3f} or raise --max-voxels")
     log(f"input {len(F)} tris, watertight={m.is_watertight}; grid {dims.tolist()} = {nvox/1e6:.0f}M voxels")
