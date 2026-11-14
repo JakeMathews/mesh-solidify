@@ -33,7 +33,7 @@ pub type FxMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
 pub struct Field<'a> {
     g: Grid,
-    mask: &'a [u8],
+    mask: std::borrow::Cow<'a, [u8]>,
     nb: [usize; 3],
     slot: Vec<u32>,
     pool: Vec<f32>,
@@ -170,6 +170,35 @@ pub fn field<'a>(
                 }
             }
         });
+    }
+    // An offset surface is not the mask's: it also wraps input that lies outside the solid
+    // (the loose parts dropped earlier) and seals gaps narrower than twice the offset into
+    // closed pockets. Clean the offset inside/outside the same way, so one shell comes out.
+    let mut mask = std::borrow::Cow::Borrowed(mask);
+    if offset > 0.0 {
+        let mut after = mask.to_vec();
+        for (s, &b) in ids.iter().enumerate() {
+            for c in 0..S * S * S {
+                let n = node(b, c);
+                if within(n) {
+                    after[g.idx(n.0, n.1, n.2)] = (pool[s * S * S * S + c] < 0.0) as u8;
+                }
+            }
+        }
+        crate::grid::clean(&mut after, g);
+        let step = (0.5 * g.h) as f32;
+        par::chunks_mut(&mut pool, S * S * S, |s, chunk| {
+            for (c, out) in chunk.iter_mut().enumerate() {
+                let n = node(ids[s], c);
+                if within(n) {
+                    let inside = after[g.idx(n.0, n.1, n.2)] != 0;
+                    if inside != (*out < 0.0) {
+                        *out = if inside { -step } else { step };
+                    }
+                }
+            }
+        });
+        mask = std::borrow::Cow::Owned(after);
     }
     Field {
         g: *g,
