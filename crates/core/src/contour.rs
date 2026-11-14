@@ -64,21 +64,42 @@ pub fn field<'a>(
     mask: &'a [u8],
     far: f64,
     offset: f64,
+    tools: &[crate::edit::Ready],
+    min_voxels: usize,
     #[cfg(feature = "gpu")] gpu: Option<&crate::gpu::Winding>,
     progress: &(dyn Fn(f32) + Sync),
-) -> Field<'a> {
+) -> (Field<'a>, Option<crate::grid::Clean>) {
     let nb = [g.n[0].div_ceil(S), g.n[1].div_ceil(S), g.n[2].div_ceil(S)];
     let nblocks = nb[0] * nb[1] * nb[2];
+    // With tools, the surface is the combined solid's: its inside/outside picks the blocks.
+    let combined: Option<Vec<u8>> = (!tools.is_empty()).then(|| {
+        let mut c = mask.to_vec();
+        let layer = g.n[0] * g.n[1];
+        par::chunks_mut(&mut c, layer, |k, chunk| {
+            for (r, m) in chunk.iter_mut().enumerate() {
+                let (i, j) = (r % g.n[0], r / g.n[0]);
+                let idx = k * layer + r;
+                let p = g.pos(i, j, k);
+                let mut inside = *m != 0;
+                for t in tools {
+                    inside = crate::edit::combine_inside(t.op, inside, t.inside(idx, p));
+                }
+                *m = inside as u8;
+            }
+        });
+        c
+    });
+    let outer: &[u8] = combined.as_deref().unwrap_or(mask);
     // Blocks holding a node whose +x, +y or +z neighbour is on the other side.
     let boundary: Vec<bool> = par::map(nblocks, |b| {
         let (bi, bj, bk) = (b % nb[0], (b / nb[0]) % nb[1], b / (nb[0] * nb[1]));
         for k in bk * S..((bk + 1) * S).min(g.n[2]) {
             for j in bj * S..((bj + 1) * S).min(g.n[1]) {
                 for i in bi * S..((bi + 1) * S).min(g.n[0]) {
-                    let m = mask[g.idx(i, j, k)];
-                    if (i + 1 < g.n[0] && mask[g.idx(i + 1, j, k)] != m)
-                        || (j + 1 < g.n[1] && mask[g.idx(i, j + 1, k)] != m)
-                        || (k + 1 < g.n[2] && mask[g.idx(i, j, k + 1)] != m)
+                    let m = outer[g.idx(i, j, k)];
+                    if (i + 1 < g.n[0] && outer[g.idx(i + 1, j, k)] != m)
+                        || (j + 1 < g.n[1] && outer[g.idx(i, j + 1, k)] != m)
+                        || (k + 1 < g.n[2] && outer[g.idx(i, j, k + 1)] != m)
                     {
                         return true;
                     }
@@ -171,12 +192,35 @@ pub fn field<'a>(
             }
         });
     }
-    // An offset surface is not the mask's: it also wraps input that lies outside the solid
-    // (the loose parts dropped earlier) and seals gaps narrower than twice the offset into
-    // closed pockets. Clean the offset inside/outside the same way, so one shell comes out.
+    // The tools, combined node by node with the solid's own distance.
+    if !tools.is_empty() {
+        par::chunks_mut(&mut pool, S * S * S, |s, chunk| {
+            for (c, out) in chunk.iter_mut().enumerate() {
+                let n = node(ids[s], c);
+                if within(n) {
+                    let idx = g.idx(n.0, n.1, n.2);
+                    let p = g.pos(n.0, n.1, n.2);
+                    let mut f = *out as f64;
+                    for t in tools {
+                        f = crate::edit::combine(t.op, f, t.sdf(idx, p, far));
+                    }
+                    let mut f = f as f32;
+                    if f.abs() < tiny {
+                        f = if f < 0.0 { -tiny } else { tiny };
+                    }
+                    *out = f;
+                }
+            }
+        });
+    }
+    // The surface that comes out is not the mask's: an offset also wraps input that lies outside
+    // the solid (the loose parts dropped earlier) and seals gaps narrower than twice the offset
+    // into closed pockets, and a cut can leave crumbs. Clean its inside/outside the same way as
+    // the mask, so one shell (or the parts asked for) comes out.
+    let mut parts = None;
     let mut mask = std::borrow::Cow::Borrowed(mask);
-    if offset > 0.0 {
-        let mut after = mask.to_vec();
+    if offset > 0.0 || !tools.is_empty() {
+        let mut after = outer.to_vec();
         for (s, &b) in ids.iter().enumerate() {
             for c in 0..S * S * S {
                 let n = node(b, c);
@@ -185,7 +229,7 @@ pub fn field<'a>(
                 }
             }
         }
-        crate::grid::clean(&mut after, g);
+        parts = Some(crate::grid::clean(&mut after, g, min_voxels));
         let step = (0.5 * g.h) as f32;
         par::chunks_mut(&mut pool, S * S * S, |s, chunk| {
             for (c, out) in chunk.iter_mut().enumerate() {
@@ -200,7 +244,8 @@ pub fn field<'a>(
         });
         mask = std::borrow::Cow::Owned(after);
     }
-    Field {
+    drop(combined);
+    (Field {
         g: *g,
         mask,
         nb,
@@ -208,7 +253,7 @@ pub fn field<'a>(
         pool,
         far_in: (-far - offset) as f32,
         far_out: (far - offset) as f32,
-    }
+    }, parts)
 }
 
 /// Kuhn's six tetrahedra of a cube; corners are bit sets (x = 1, y = 2, z = 4).

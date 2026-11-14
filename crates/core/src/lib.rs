@@ -25,6 +25,7 @@ pub mod bvh;
 pub mod check;
 mod contour;
 mod decimate;
+pub mod edit;
 mod fair;
 #[cfg(feature = "gpu")]
 mod gpu;
@@ -36,7 +37,8 @@ mod pipeline;
 
 pub use check::{inspect, Inspection, Verification};
 pub use mesh::Mesh;
-pub use pipeline::{auto_voxel, grid_dims, solidify, Error, Monitor, NoMonitor, Params, Report};
+pub use edit::{Op, Shape, Tool};
+pub use pipeline::{auto_voxel, grid_dims, solidify, solidify_with, DroppedPart, Error, Monitor, NoMonitor, Params, Report};
 
 /// Simplify a closed manifold mesh to about `target` triangles, keeping it closed and manifold.
 pub fn simplify(m: &mut Mesh, target: usize) {

@@ -224,6 +224,7 @@ fn do_solidify(params: &str) -> Result<String, PluginError> {
         max_voxels: input.max_voxels,
         smooth_fill: input.smooth_fill,
         gpu: false,
+        min_part_mm3: 0.0,
     };
     let (mut out, report) = solidify(&mesh, &p, &Host).map_err(|e| match e {
         Error::Cancelled => PluginError::Cancelled,

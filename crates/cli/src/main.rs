@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use clap::Parser;
-use mesh_solidify::{inspect, io, solidify, Error, Mesh, Monitor, Params};
+use mesh_solidify::{inspect, io, solidify_with, Error, Mesh, Monitor, Op, Params, Shape, Tool};
 use serde_json::{json, Value};
 
 const AFTER: &str = "\
@@ -58,6 +58,27 @@ struct Args {
     /// Don't use the GPU for the winding number
     #[arg(long)]
     no_gpu: bool,
+    /// Keep every separate solid part of at least this volume (mm³), not only the largest
+    #[arg(long, default_value_t = 0.0)]
+    min_part: f64,
+    /// Add (union) another mesh, in the input's coordinates; repeatable
+    #[arg(long, value_name = "FILE")]
+    add: Vec<PathBuf>,
+    /// Subtract another mesh; repeatable
+    #[arg(long, value_name = "FILE")]
+    subtract: Vec<PathBuf>,
+    /// Keep only what is inside another mesh; repeatable
+    #[arg(long, value_name = "FILE")]
+    intersect: Vec<PathBuf>,
+    /// Remove an axis-aligned box "x0,y0,z0,x1,y1,z1" (input coordinates); repeatable
+    #[arg(long, value_name = "BOX", allow_hyphen_values = true)]
+    remove_box: Vec<String>,
+    /// Keep only an axis-aligned box "x0,y0,z0,x1,y1,z1"; repeatable
+    #[arg(long, value_name = "BOX", allow_hyphen_values = true)]
+    keep_box: Vec<String>,
+    /// Cut by a plane and keep the side its normal points to: "x,y,z,nx,ny,nz"; repeatable
+    #[arg(long, value_name = "PLANE", allow_hyphen_values = true)]
+    keep_side: Vec<String>,
     /// Worker threads (default: all cores)
     #[arg(long, value_parser = count)]
     threads: Option<usize>,
@@ -301,9 +322,37 @@ fn main() -> ExitCode {
         max_voxels: a.max_voxels,
         smooth_fill: a.smooth_fill,
         gpu: !a.no_gpu,
+        min_part_mm3: a.min_part,
     };
+    let mut tools = Vec::new();
+    for (files, op) in [(&a.add, Op::Union), (&a.subtract, Op::Subtract), (&a.intersect, Op::Intersect)] {
+        for f in files {
+            let data = match std::fs::read(f) {
+                Ok(d) => d,
+                Err(e) => return fail(a.json, 2, "invalid_argument", &format!("{}: {e}", f.display()), &start),
+            };
+            match io::read(&f.to_string_lossy(), &data) {
+                Ok(m) => tools.push(Tool { shape: Shape::Mesh(m), op }),
+                Err(e) => return fail(a.json, 2, "invalid_argument", &format!("{}: {e}", f.display()), &start),
+            }
+        }
+    }
+    let nums = |s: &str, n: usize| -> Option<Vec<f64>> {
+        let v: Vec<f64> = s.split(',').map(|x| x.trim().parse().ok()).collect::<Option<_>>()?;
+        (v.len() == n).then_some(v)
+    };
+    for (list, op) in [(&a.remove_box, Op::Subtract), (&a.keep_box, Op::Intersect)] {
+        for b in list {
+            let Some(v) = nums(b, 6) else { return fail(a.json, 2, "invalid_argument", &format!("a box is six numbers x0,y0,z0,x1,y1,z1 (not {b:?})"), &start) };
+            tools.push(Tool::aabb([v[0], v[1], v[2]], [v[3], v[4], v[5]], op));
+        }
+    }
+    for c in &a.keep_side {
+        let Some(v) = nums(c, 6) else { return fail(a.json, 2, "invalid_argument", &format!("a plane is six numbers x,y,z,nx,ny,nz (not {c:?})"), &start) };
+        tools.push(Tool::keep_side([v[0], v[1], v[2]], [v[3], v[4], v[5]]));
+    }
     log.line(&format!("read {name}: {} triangles", mesh.f.len()));
-    let (out, report) = match solidify(&mesh, &p, &log) {
+    let (out, report) = match solidify_with(&mesh, &tools, &p, &log) {
         Ok(x) => x,
         Err(e @ Error::GridTooLarge { .. }) => {
             return fail(a.json, 4, "grid_too_large", &e.to_string(), &start)

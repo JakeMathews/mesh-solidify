@@ -299,24 +299,59 @@ fn label(mask: &[u8], g: &Grid, value: u8) -> Runs {
     }
 }
 
-/// Keep the largest inside component and fill outside pockets that don't reach the border.
-/// Returns (inside voxels dropped, void voxels filled, inside components found).
-pub fn clean(mask: &mut [u8], g: &Grid) -> (usize, usize, usize) {
+/// A solid part `clean` dropped: its size in voxels and the nodes it spans (inclusive).
+#[derive(Clone, Debug)]
+pub struct Part {
+    pub voxels: usize,
+    pub lo: [usize; 3],
+    pub hi: [usize; 3],
+}
+
+/// What `clean` did.
+pub struct Clean {
+    pub dropped: usize,
+    pub filled: usize,
+    pub comps: usize,
+    /// The parts dropped, largest first.
+    pub parts: Vec<Part>,
+}
+
+/// Keep the largest inside component (and, with `min_voxels` above 0, every other one of at
+/// least that many voxels) and fill outside pockets that don't reach the border.
+pub fn clean(mask: &mut [u8], g: &Grid, min_voxels: usize) -> Clean {
     let n0 = g.n[0];
     let n1 = g.n[1];
     let mut runs = label(mask, g, 1);
     let nr = runs.x0.len();
     let mut size = vec![0usize; nr];
-    for a in 0..nr {
-        let root = find(&mut runs.parent, a as u32) as usize;
-        size[root] += (runs.x1[a] - runs.x0[a]) as usize;
+    let mut lo = vec![[usize::MAX; 3]; nr];
+    let mut hi = vec![[0usize; 3]; nr];
+    for r in 0..runs.start.len() - 1 {
+        let (j, k) = (r % n1, r / n1);
+        for a in runs.start[r]..runs.start[r + 1] {
+            let root = find(&mut runs.parent, a as u32) as usize;
+            size[root] += (runs.x1[a] - runs.x0[a]) as usize;
+            let (l, h) = (&mut lo[root], &mut hi[root]);
+            l[0] = l[0].min(runs.x0[a] as usize);
+            h[0] = h[0].max(runs.x1[a] as usize - 1);
+            l[1] = l[1].min(j);
+            h[1] = h[1].max(j);
+            l[2] = l[2].min(k);
+            h[2] = h[2].max(k);
+        }
     }
     let comps = (0..nr).filter(|&a| runs.parent[a] as usize == a).count();
-    let keep = (0..nr).max_by_key(|&a| size[a]).unwrap_or(0) as u32;
+    let keep = (0..nr).max_by_key(|&a| size[a]).unwrap_or(0);
+    let kept = |root: usize| root == keep || (min_voxels > 0 && size[root] >= min_voxels);
+    let mut parts: Vec<Part> = (0..nr)
+        .filter(|&a| runs.parent[a] as usize == a && !kept(a))
+        .map(|a| Part { voxels: size[a], lo: lo[a], hi: hi[a] })
+        .collect();
+    parts.sort_by(|a, b| b.voxels.cmp(&a.voxels));
     let mut dropped = 0;
     for r in 0..runs.start.len() - 1 {
         for a in runs.start[r]..runs.start[r + 1] {
-            if find(&mut runs.parent, a as u32) != keep {
+            if !kept(find(&mut runs.parent, a as u32) as usize) {
                 mask[r * n0 + runs.x0[a] as usize..r * n0 + runs.x1[a] as usize].fill(0);
                 dropped += (runs.x1[a] - runs.x0[a]) as usize;
             }
@@ -351,7 +386,7 @@ pub fn clean(mask: &mut [u8], g: &Grid) -> (usize, usize, usize) {
             }
         }
     }
-    (dropped, filled, comps)
+    Clean { dropped, filled, comps, parts }
 }
 
 /// Why the GPU pass stopped.
