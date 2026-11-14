@@ -34,6 +34,7 @@ pub mod io;
 pub mod mesh;
 mod par;
 mod pipeline;
+pub mod slice;
 
 pub use check::{inspect, Inspection, Verification};
 pub use mesh::Mesh;

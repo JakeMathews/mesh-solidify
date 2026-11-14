@@ -17,6 +17,7 @@ Examples:
   mesh-solidify model.stl fixed.3mf --scale 10%
   mesh-solidify scan.ply fixed.stl --voxel 0.2 --min-feature 0.2
   mesh-solidify model.stl --inspect --json
+  mesh-solidify scan.stl top.stl --cut-only --keep-side 0,0,175,0,0,1
 
 Exit codes: 0 ok, 1 error, 2 bad arguments, 3 output failed verification, 4 grid too large.";
 
@@ -79,6 +80,13 @@ struct Args {
     /// Cut by a plane and keep the side its normal points to: "x,y,z,nx,ny,nz"; repeatable
     #[arg(long, value_name = "PLANE", allow_hyphen_values = true)]
     keep_side: Vec<String>,
+    /// Only cut: apply --keep-side, --keep-box and --remove-box to the triangles directly (in
+    /// that order), capping the openings flat, without rebuilding the mesh
+    #[arg(long)]
+    cut_only: bool,
+    /// With --cut-only: leave the openings open
+    #[arg(long)]
+    no_cap: bool,
     /// Worker threads (default: all cores)
     #[arg(long, value_parser = count)]
     threads: Option<usize>,
@@ -352,6 +360,44 @@ fn main() -> ExitCode {
         tools.push(Tool::keep_side([v[0], v[1], v[2]], [v[3], v[4], v[5]]));
     }
     log.line(&format!("read {name}: {} triangles", mesh.f.len()));
+    if a.cut_only {
+        use mesh_solidify::slice::{cut, Region, Step};
+        let mut steps = Vec::new();
+        for c in &a.keep_side {
+            let v = nums(c, 6).unwrap();
+            steps.push(Step { region: Region::Plane { point: [v[0], v[1], v[2]], normal: [v[3], v[4], v[5]] }, keep: true });
+        }
+        for (list, keep) in [(&a.keep_box, true), (&a.remove_box, false)] {
+            for b in list {
+                let v = nums(b, 6).unwrap();
+                steps.push(Step { region: Region::aabb([v[0], v[1], v[2]], [v[3], v[4], v[5]]), keep });
+            }
+        }
+        if steps.is_empty() {
+            return fail(a.json, 2, "invalid_argument", "--cut-only needs --keep-side, --keep-box or --remove-box", &start);
+        }
+        mesh.scale(a.scale);
+        let (out, report) = match cut(&mesh, &steps, !a.no_cap) {
+            Ok(x) => x,
+            Err(e) => return fail(a.json, 2, "invalid_argument", &e, &start),
+        };
+        if let Err(e) = write_mesh(&out, &dst) {
+            return fail(a.json, 1, "write_failed", &e, &start);
+        }
+        let i = inspect(&out);
+        log.line(&format!("cut: {} triangles, {} split, {} caps, {} open loops; watertight={}", out.f.len(), report.triangles_split, report.caps, report.open_loops, i.watertight));
+        let mut v = serde_json::to_value(&report).unwrap();
+        let o = v.as_object_mut().unwrap();
+        o.insert("ok".into(), json!(true));
+        o.insert("mode".into(), json!("cut"));
+        o.insert("triangles".into(), json!(out.f.len()));
+        o.insert("watertight".into(), json!(i.watertight));
+        o.insert("output".into(), json!(std::fs::canonicalize(&dst).unwrap_or(dst).to_string_lossy()));
+        o.insert("seconds".into(), json!(round1(&start)));
+        o.insert("version".into(), json!(mesh_solidify::VERSION));
+        emit(a.json, &v);
+        return ExitCode::SUCCESS;
+    }
     let (out, report) = match solidify_with(&mesh, &tools, &p, &log) {
         Ok(x) => x,
         Err(e @ Error::GridTooLarge { .. }) => {
