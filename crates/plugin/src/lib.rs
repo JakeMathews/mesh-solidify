@@ -40,6 +40,7 @@ struct SolidifyInput {
     fair_tau: f64,
     fair_grow: usize,
     max_voxels: usize,
+    smooth_fill: bool,
 }
 
 impl Default for SolidifyInput {
@@ -54,6 +55,7 @@ impl Default for SolidifyInput {
             fair_tau: 0.5,
             fair_grow: 2,
             max_voxels: 1_500_000,
+            smooth_fill: false,
         }
     }
 }
@@ -220,6 +222,8 @@ fn do_solidify(params: &str) -> Result<String, PluginError> {
         fair_tau: input.fair_tau,
         fair_grow: input.fair_grow,
         max_voxels: input.max_voxels,
+        smooth_fill: input.smooth_fill,
+        gpu: false,
     };
     let (mut out, report) = solidify(&mesh, &p, &Host).map_err(|e| match e {
         Error::Cancelled => PluginError::Cancelled,

@@ -157,3 +157,90 @@ fn file_formats_round_trip() {
     let back = io::read("x.ply", ply.as_bytes()).unwrap();
     assert_eq!(back.f.len(), 3);
 }
+
+/// A 2 x 2 x 1 box (z from 0 to 1) without its top face.
+fn open_box() -> Mesh {
+    let (w, d, hgt) = (2.0, 2.0, 1.0);
+    let n = 20;
+    let mut tris: Vec<[[f64; 3]; 3]> = Vec::new();
+    // Tile a rectangle given by an origin and two edge vectors, outward by right-hand rule.
+    let mut quad = |o: [f64; 3], u: [f64; 3], v: [f64; 3]| {
+        for i in 0..n {
+            for j in 0..n {
+                let p = |a: usize, b: usize| {
+                    let (s, t) = (a as f64 / n as f64, b as f64 / n as f64);
+                    [
+                        o[0] + s * u[0] + t * v[0],
+                        o[1] + s * u[1] + t * v[1],
+                        o[2] + s * u[2] + t * v[2],
+                    ]
+                };
+                tris.push([p(i, j), p(i + 1, j), p(i + 1, j + 1)]);
+                tris.push([p(i, j), p(i + 1, j + 1), p(i, j + 1)]);
+            }
+        }
+    };
+    quad([0., 0., 0.], [0., d, 0.], [w, 0., 0.]); // bottom, facing -z
+    quad([0., 0., 0.], [w, 0., 0.], [0., 0., hgt]); // y = 0
+    quad([w, d, 0.], [-w, 0., 0.], [0., 0., hgt]); // y = d
+    quad([0., d, 0.], [0., -d, 0.], [0., 0., hgt]); // x = 0
+    quad([w, 0., 0.], [0., d, 0.], [0., 0., hgt]); // x = w
+    Mesh::from_soup(tris)
+}
+
+/// How far the top patch strays from the plane z = 1 (the missing face), worst case, among
+/// vertices more than `lo` from the walls.
+fn top_bulge(m: &Mesh, lo: f64) -> f64 {
+    m.v.iter()
+        .filter(|p| p[2] > 0.5 && p[0] > lo && p[0] < 2.0 - lo && p[1] > lo && p[1] < 2.0 - lo)
+        .map(|p| (p[2] - 1.0).abs())
+        .fold(0.0, f64::max)
+}
+
+#[test]
+fn flat_fill_keeps_a_missing_face_flat() {
+    let b = open_box();
+    assert!(!inspect(&b).watertight);
+    let p = Params {
+        voxel: 0.04,
+        target_faces: 4000,
+        ..Params::default()
+    };
+    let (flat, r) = solidify(&b, &p, &NoMonitor).unwrap();
+    assert!(r.ok, "{r:?}");
+    let f = top_bulge(&flat, 0.1);
+    // Within two voxels of the missing face (the patch sits where the grid's inside/outside
+    // flips, up to a voxel off).
+    assert!(f < 0.08, "flat fill strays {f} from the missing face");
+    let v = flat.volume();
+    assert!((v - 4.0).abs() < 0.2, "volume {v}");
+}
+
+#[test]
+fn progress_runs_from_start_to_end_in_order() {
+    use std::sync::Mutex;
+    struct Rec(Mutex<Vec<f32>>);
+    impl mesh_solidify::Monitor for Rec {
+        fn progress(&self, f: f32, _stage: &str) {
+            self.0.lock().unwrap().push(f);
+        }
+    }
+    let rec = Rec(Mutex::new(Vec::new()));
+    let p = Params {
+        voxel: 0.04,
+        target_faces: 1000,
+        ..Params::default()
+    };
+    solidify(&open_box(), &p, &rec).unwrap();
+    let v = rec.0.into_inner().unwrap();
+    assert!(v.len() > 10, "only {} progress reports", v.len());
+    assert!(v.iter().all(|f| (0.0..=1.0).contains(f)));
+    // Stages run one after another; the winding and distance passes report from worker
+    // threads, so only the stages after them are checked for order.
+    let after_winding: Vec<f32> = v.iter().copied().filter(|&f| f >= 0.33).collect();
+    assert!(
+        after_winding.windows(2).all(|w| w[1] >= w[0] - 1e-6),
+        "{after_winding:?}"
+    );
+    assert!(*v.last().unwrap() > 0.99);
+}

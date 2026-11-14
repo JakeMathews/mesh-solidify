@@ -4,9 +4,10 @@ use serde::Serialize;
 
 use crate::bvh::Bvh;
 use crate::check::{verify, Verification};
+use crate::fair::Adjacency;
 use crate::grid::{self, Grid};
 use crate::mesh::{sub, Mesh, V3};
-use crate::{contour, decimate, fair};
+use crate::{contour, decimate, fair, par};
 
 /// Tuning knobs. Lengths are in output millimetres (after `scale`).
 #[derive(Clone, Debug, Serialize)]
@@ -28,6 +29,13 @@ pub struct Params {
     pub fair_grow: usize,
     /// Refuse grids with more nodes than this.
     pub max_voxels: usize,
+    /// Fair hole patches as a thin plate (curvature-continuous: right for organic, curved
+    /// shapes) instead of a membrane (spans flat between the edges around it and meets them at a
+    /// crease: right for boxy, machined parts). Off by default.
+    pub smooth_fill: bool,
+    /// Evaluate winding numbers on the GPU when the crate is built with its `gpu` feature and
+    /// there is one. On by default.
+    pub gpu: bool,
 }
 
 impl Default for Params {
@@ -41,6 +49,8 @@ impl Default for Params {
             fair_tau: 0.5,
             fair_grow: 2,
             max_voxels: 400_000_000,
+            smooth_fill: false,
+            gpu: true,
         }
     }
 }
@@ -51,6 +61,23 @@ pub trait Monitor: Sync {
     fn log(&self, _message: &str) {}
     fn cancelled(&self) -> bool {
         false
+    }
+}
+
+/// Passes `mon` through with its progress mapped onto one stage of the whole bar.
+struct Scaled<'a> {
+    mon: &'a dyn Monitor,
+    bar: &'a (dyn Fn(f32) + Sync),
+}
+impl Monitor for Scaled<'_> {
+    fn progress(&self, fraction: f32, _stage: &str) {
+        (self.bar)(fraction)
+    }
+    fn log(&self, message: &str) {
+        self.mon.log(message)
+    }
+    fn cancelled(&self) -> bool {
+        self.mon.cancelled()
     }
 }
 
@@ -202,10 +229,54 @@ pub fn solidify(input: &Mesh, p: &Params, mon: &dyn Monitor) -> Result<(Mesh, Re
         h
     ));
 
-    mon.progress(0.0, "indexing");
+    // One bar over the whole run: each stage fills its share.
+    let shares: &[(&str, f32)] = &[
+        ("winding number", 0.25),
+        ("signed distance", 0.07),
+        ("contouring", 0.08),
+        ("fairing hole patches", 0.20),
+        ("decimating", 0.40),
+    ];
+    let stage = |n: usize| {
+        let lo: f32 = shares[..n].iter().map(|s| s.1).sum();
+        let (name, w) = shares[n];
+        move |f: f32| mon.progress(lo + w * f.clamp(0.0, 1.0), name)
+    };
+    let mut at = 0;
+    let mut next = || {
+        at += 1;
+        stage(at - 1)
+    };
+
+    let bar = next();
+    bar(0.0);
     let bvh = Bvh::new(&m);
-    let (mut mask, evals) =
-        grid::inside_mask(&bvh, &g, p.iso, 0.5 * h, mon).map_err(|_| Error::Cancelled)?;
+    let scaled = Scaled { mon, bar: &bar };
+    #[allow(unused_mut)]
+    let mut on_gpu: Option<(Vec<u8>, usize)> = None;
+    #[cfg(feature = "gpu")]
+    if p.gpu {
+        let centre = g.pos(dims[0] / 2, dims[1] / 2, dims[2] / 2);
+        match crate::gpu::Winding::new(&bvh, 2.0, centre) {
+            Ok(w) => {
+                mon.log(&format!("winding number on the GPU: {}", w.name));
+                match grid::inside_mask_gpu(&bvh, &w, &g, p.iso, 0.5 * h, &scaled) {
+                    Ok(r) => on_gpu = Some(r),
+                    Err(grid::GpuStop::Cancelled) => return Err(Error::Cancelled),
+                    Err(grid::GpuStop::Failed(e)) => {
+                        mon.log(&format!("the GPU pass failed ({e}); using the CPU"))
+                    }
+                }
+            }
+            Err(e) => mon.log(&format!("no GPU to use ({e}); using the CPU")),
+        }
+    }
+    let (mut mask, evals) = match on_gpu {
+        Some(r) => r,
+        None => {
+            grid::inside_mask(&bvh, &g, p.iso, 0.5 * h, &scaled).map_err(|_| Error::Cancelled)?
+        }
+    };
     mon.log(&format!(
         "winding number: {:.1}M evaluations ({:.0}% of the grid)",
         evals as f64 / 1e6,
@@ -223,11 +294,11 @@ pub fn solidify(input: &Mesh, p: &Params, mon: &dyn Monitor) -> Result<(Mesh, Re
         return Err(Error::Cancelled);
     }
 
-    mon.progress(0.0, "signed distance");
     let far = (k_band + 1) as f64 * h;
-    let field = contour::field(&bvh, &g, &mask, far, p.min_feature);
-    mon.progress(0.0, "contouring");
-    let mut out = contour::march(&field);
+    let bar = next();
+    let field = contour::field(&bvh, &g, &mask, far, p.min_feature, &bar);
+    let bar = next();
+    let mut out = contour::march(&field, &bar);
     drop(field);
     drop(mask);
     let contour_triangles = out.f.len();
@@ -239,14 +310,21 @@ pub fn solidify(input: &Mesh, p: &Params, mon: &dyn Monitor) -> Result<(Mesh, Re
     }
 
     let mut faired = 0;
+    let bar = next();
     if p.fair_tau > 0.0 {
-        mon.progress(0.0, "fairing hole patches");
+        bar(0.0);
+        let thr = p.min_feature + p.fair_tau * h;
+        let farv: Vec<bool> =
+            par::map(out.v.len(), |i| bvh.dist2(out.v[i], thr * thr) >= thr * thr);
+        let adj = Adjacency::new(&out);
         faired = fair::fair(
             &mut out,
-            &bvh,
-            p.min_feature + p.fair_tau * h,
+            &adj,
+            &farv,
             p.fair_grow,
+            !p.smooth_fill,
             400,
+            &bar,
         );
         mon.log(&format!(
             "faired {faired} hole-patch vertices ({:.1}%)",
@@ -257,9 +335,11 @@ pub fn solidify(input: &Mesh, p: &Params, mon: &dyn Monitor) -> Result<(Mesh, Re
         return Err(Error::Cancelled);
     }
 
-    mon.progress(0.0, "decimating");
-    decimate::decimate(&mut out, p.target_faces, &|| mon.cancelled())
+    let bar = next();
+    bar(0.0);
+    decimate::decimate(&mut out, p.target_faces, &|| mon.cancelled(), &bar)
         .map_err(|_| Error::Cancelled)?;
+    bar(1.0);
     let v: Verification = verify(&out);
     let s = out.size();
     mon.log(&format!(

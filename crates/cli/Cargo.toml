@@ -13,7 +13,7 @@ name = "mesh-solidify"
 path = "src/main.rs"
 
 [dependencies]
-mesh-solidify = { workspace = true, features = ["parallel"] }
+mesh-solidify = { workspace = true, features = ["parallel", "gpu"] }
 serde_json.workspace = true
 clap = { version = "4", features = ["derive"] }
 rayon = "1"

@@ -51,6 +51,13 @@ struct Args {
     /// Refuse grids with more nodes than this (about 1 byte of RAM each, plus the surface)
     #[arg(long, default_value = "400000000", value_parser = count)]
     max_voxels: usize,
+    /// Fair hole patches as a smooth thin plate (for organic, curved shapes) instead of a flat
+    /// membrane that meets the faces around it at a crease (for boxy, machined parts)
+    #[arg(long)]
+    smooth_fill: bool,
+    /// Don't use the GPU for the winding number
+    #[arg(long)]
+    no_gpu: bool,
     /// Worker threads (default: all cores)
     #[arg(long, value_parser = count)]
     threads: Option<usize>,
@@ -292,6 +299,8 @@ fn main() -> ExitCode {
         fair_tau: a.fair_tau,
         fair_grow: a.fair_grow,
         max_voxels: a.max_voxels,
+        smooth_fill: a.smooth_fill,
+        gpu: !a.no_gpu,
     };
     log.line(&format!("read {name}: {} triangles", mesh.f.len()));
     let (out, report) = match solidify(&mesh, &p, &log) {

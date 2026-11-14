@@ -1,9 +1,13 @@
-//! Biharmonic fairing of hole patches: vertices that are far from every input triangle were
-//! invented to close a hole, so they are moved to minimise the bi-Laplacian energy with the
-//! rest of the surface held fixed. Patches then continue the curvature around them instead of
-//! keeping the voxel steps of the inside/outside mask.
+//! Fairing of hole patches: vertices that are far from every input triangle were invented to
+//! close a hole, so they are moved to smooth out the voxel steps of the inside/outside mask,
+//! with the rest of the surface held fixed.
+//!
+//! - Flat (membrane, Laplacian energy): the patch spans tight between the edges around it, so
+//!   it stays flat where the gap is flat and meets the faces around it at a crease, the way a
+//!   missing underside or bottom would.
+//! - Smooth (thin plate, bi-Laplacian energy): the patch continues the curvature around it.
+//!   Right for curved surfaces; on boxy parts it bulges and rounds corners over.
 
-use crate::bvh::Bvh;
 use crate::mesh::Mesh;
 use crate::par;
 
@@ -60,12 +64,18 @@ impl Adjacency {
     }
 }
 
-/// Fair the vertices farther than `thr` from the input (`bvh`), grown by `grow` rings.
-/// Returns how many vertices moved.
-pub fn fair(m: &mut Mesh, bvh: &Bvh, thr: f64, grow: usize, max_iter: usize) -> usize {
+/// Fair the vertices marked `far` (far from the input: they patch a hole), grown by `grow`
+/// rings, as a membrane (`flat`) or a thin plate. Returns how many vertices moved.
+pub fn fair(
+    m: &mut Mesh,
+    adj: &Adjacency,
+    far: &[bool],
+    grow: usize,
+    flat: bool,
+    max_iter: usize,
+    progress: &dyn Fn(f32),
+) -> usize {
     let nv = m.v.len();
-    let far: Vec<bool> = par::map(nv, |i| bvh.dist2(m.v[i], thr * thr) >= thr * thr);
-    let adj = Adjacency::new(m);
     // 0 = fixed and untouched, 1 = free, 2 = first fixed ring, 3 = second fixed ring.
     let mut role = vec![0u8; nv];
     let mut front: Vec<u32> = (0..nv as u32).filter(|&i| far[i as usize]).collect();
@@ -137,22 +147,33 @@ pub fn fair(m: &mut Mesh, bvh: &Bvh, thr: f64, grow: usize, max_iter: usize) -> 
             s
         })
     };
-    // M p = (K K p) on free vertices, p zero outside them.
+    // M p = K p (membrane) or K K p (thin plate) on free vertices, p zero outside them.
     let apply = |p: &[[f64; 3]]| -> Vec<[f64; 3]> {
         let mut full = vec![[0.0; 3]; n];
         full[..nfree].copy_from_slice(p);
+        if flat {
+            return lap(&full, nfree);
+        }
         let mut y = lap(&full, nkr);
         y.resize(n, [0.0; 3]);
         lap(&y, nfree)
     };
-    let mut y0 = lap(&x0, nkr);
-    y0.resize(n, [0.0; 3]);
-    let ky0 = lap(&y0, nfree);
-    let b: Vec<[f64; 3]> = ky0.iter().map(|v| [-v[0], -v[1], -v[2]]).collect();
+    let kx0 = if flat {
+        lap(&x0, nfree)
+    } else {
+        let mut y0 = lap(&x0, nkr);
+        y0.resize(n, [0.0; 3]);
+        lap(&y0, nfree)
+    };
+    let b: Vec<[f64; 3]> = kx0.iter().map(|v| [-v[0], -v[1], -v[2]]).collect();
     let dinv: Vec<f64> = (0..nfree)
         .map(|i| {
             let d = nbr[i].len() as f64;
-            1.0 / (d * d + d)
+            if flat {
+                1.0 / d
+            } else {
+                1.0 / (d * d + d)
+            }
         })
         .collect();
 
@@ -174,7 +195,10 @@ pub fn fair(m: &mut Mesh, bvh: &Bvh, thr: f64, grow: usize, max_iter: usize) -> 
     };
     let bnorm = dot3(&b, &b);
     let mut rz = dot3(&r, &z);
-    for _ in 0..max_iter {
+    let goal = 1e-10f64.ln();
+    // The residual isn't monotonic; the bar is.
+    let mut shown = 0.0f64;
+    for it in 0..max_iter {
         let ap = apply(&p);
         let pap = dot3(&p, &ap);
         let mut alpha = [0.0; 3];
@@ -188,9 +212,23 @@ pub fn fair(m: &mut Mesh, bvh: &Bvh, thr: f64, grow: usize, max_iter: usize) -> 
             }
         }
         let rr = dot3(&r, &r);
+        if std::env::var_os("MESH_SOLIDIFY_DEBUG").is_some() && (it % 50 == 0 || it + 1 == max_iter)
+        {
+            eprintln!(
+                "fair it {it}: residual {:.2e} (free {nfree})",
+                (0..3)
+                    .map(|k| (rr[k] / bnorm[k].max(1e-30)).sqrt())
+                    .fold(0.0, f64::max)
+            );
+        }
         if (0..3).all(|k| rr[k] <= 1e-10 * bnorm[k].max(1e-30)) {
             break;
         }
+        let reached = (0..3)
+            .map(|k| (rr[k] / bnorm[k].max(1e-30)).max(1e-30).ln() / goal)
+            .fold(f64::INFINITY, f64::min);
+        shown = shown.max((it as f64 / max_iter as f64).max(reached).clamp(0.0, 1.0));
+        progress(shown as f32);
         for i in 0..nfree {
             for k in 0..3 {
                 z[i][k] = r[i][k] * dinv[i];

@@ -10,8 +10,9 @@
 //! 3. **Narrow-band signed distance** to the input, so the rebuilt surface follows the
 //!    original faces instead of voxel steps.
 //! 4. **Marching tetrahedra**, which is crack-free and manifold by construction.
-//! 5. **Biharmonic fairing** of the vertices that patch holes, so patches follow the
-//!    curvature of the surrounding surface.
+//! 5. **Fairing** of the vertices that patch holes: as a membrane by default, so patches span
+//!    flat between the edges around them and meet them at a crease; or as a thin plate, which
+//!    follows the curvature around them (for organic shapes).
 //! 6. **Quadric decimation** to a triangle budget, keeping the mesh closed and manifold.
 //!
 //! The crate has no I/O or platform dependencies beyond mesh file parsing, so it builds for
@@ -25,6 +26,8 @@ pub mod check;
 mod contour;
 mod decimate;
 mod fair;
+#[cfg(feature = "gpu")]
+mod gpu;
 mod grid;
 pub mod io;
 pub mod mesh;
@@ -37,7 +40,7 @@ pub use pipeline::{auto_voxel, grid_dims, solidify, Error, Monitor, NoMonitor, P
 
 /// Simplify a closed manifold mesh to about `target` triangles, keeping it closed and manifold.
 pub fn simplify(m: &mut Mesh, target: usize) {
-    let _ = decimate::decimate(m, target, &|| false);
+    let _ = decimate::decimate(m, target, &|| false, &|_| {});
 }
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

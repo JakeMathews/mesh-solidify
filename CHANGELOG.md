@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- **GPU winding numbers** (`gpu` feature, on in the CLI; Metal, Vulkan or DX12 through wgpu):
+  the winding-number pass runs about 15× faster (toolbox, 5 billion voxels: 55 s to 3.7 s on an
+  M3 Max). Falls back to the CPU when there is no GPU; `--no-gpu` turns it off.
+- **Parallel decimation**: threshold sweeps run on all cores by region of space, about 3× faster.
+- **Flat fill is the default**: hole patches are faired as a membrane, so they span flat between
+  the edges around them and meet them at a crease instead of bulging. `--smooth-fill` keeps the
+  curvature-continuous patches of 0.2 (for organic shapes).
+- Decimation no longer locks up on slivers at very high reduction ratios (a full-scale run could
+  stop at over a million triangles with a third of them degenerate).
+- Progress is reported through every stage as one bar, not only during the winding number.
+
 ## 0.2.0
 
 Rewritten in Rust, primarily as a SolidCraft plugin.

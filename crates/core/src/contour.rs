@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::bvh::Bvh;
 use crate::grid::Grid;
@@ -57,7 +58,14 @@ impl Field<'_> {
 
 /// Signed distance (negative inside), clamped to `far`, offset outward by `offset`, stored only
 /// in blocks near the mask boundary. Elsewhere the field is +-far.
-pub fn field<'a>(bvh: &Bvh, g: &Grid, mask: &'a [u8], far: f64, offset: f64) -> Field<'a> {
+pub fn field<'a>(
+    bvh: &Bvh,
+    g: &Grid,
+    mask: &'a [u8],
+    far: f64,
+    offset: f64,
+    progress: &(dyn Fn(f32) + Sync),
+) -> Field<'a> {
     let nb = [g.n[0].div_ceil(S), g.n[1].div_ceil(S), g.n[2].div_ceil(S)];
     let nblocks = nb[0] * nb[1] * nb[2];
     // Blocks holding a node whose +x, +y or +z neighbour is on the other side.
@@ -98,7 +106,13 @@ pub fn field<'a>(bvh: &Bvh, g: &Grid, mask: &'a [u8], far: f64, offset: f64) -> 
     }
     let tiny = (1e-6 * g.h) as f32;
     let mut pool = vec![0f32; ids.len() * S * S * S];
+    let done = AtomicUsize::new(0);
+    let every = (ids.len() / 200).max(1);
     par::chunks_mut(&mut pool, S * S * S, |s, chunk| {
+        let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+        if d % every == 0 {
+            progress(d as f32 / ids.len() as f32);
+        }
         let b = ids[s];
         let (bi, bj, bk) = (b % nb[0], (b / nb[0]) % nb[1], b / (nb[0] * nb[1]));
         for k in 0..S {
@@ -141,14 +155,18 @@ const TETS: [[u8; 4]; 6] = [
 ];
 
 /// Contour the zero level of `f` (outward = positive side).
-pub fn march(f: &Field) -> Mesh {
+pub fn march(f: &Field, progress: &dyn Fn(f32)) -> Mesh {
     let g = &f.g;
     let mut mesh = Mesh::default();
     let mut verts: FxMap<u64, u32> = FxMap::default();
     let blocks: Vec<usize> = (0..f.slot.len())
         .filter(|&b| f.slot[b] != u32::MAX)
         .collect();
-    for b in blocks {
+    let every = (blocks.len() / 200).max(1);
+    for (n, &b) in blocks.iter().enumerate() {
+        if n % every == 0 {
+            progress(n as f32 / blocks.len() as f32);
+        }
         let nb = f.nb;
         let (bi, bj, bk) = (b % nb[0], (b / nb[0]) % nb[1], b / (nb[0] * nb[1]));
         for k in bk * S..((bk + 1) * S).min(g.n[2] - 1) {

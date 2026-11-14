@@ -353,3 +353,204 @@ pub fn clean(mask: &mut [u8], g: &Grid) -> (usize, usize, usize) {
     }
     (dropped, filled, comps)
 }
+
+/// Why the GPU pass stopped.
+#[cfg(feature = "gpu")]
+pub enum GpuStop {
+    Cancelled,
+    Failed(String),
+}
+
+/// [`inside_mask`] with the winding numbers evaluated on the GPU. The octree is refined level
+/// by level so each level's points go to the GPU as one batch per slab; which boxes are near
+/// the input is still decided on the CPU.
+#[cfg(feature = "gpu")]
+pub fn inside_mask_gpu(
+    bvh: &Bvh,
+    gpu: &crate::gpu::Winding,
+    g: &Grid,
+    iso: f64,
+    near: f64,
+    mon: &dyn Monitor,
+) -> Result<(Vec<u8>, usize), GpuStop> {
+    use std::sync::Mutex;
+    let nb = [g.n[0].div_ceil(B), g.n[1].div_ceil(B), g.n[2].div_ceil(B)];
+    let cn = [nb[0] + 1, nb[1] + 1, nb[2] + 1];
+    let cnode = |c: usize, ax: usize| (c * B).min(g.n[ax] - 1);
+    let node = |i: usize, j: usize, k: usize| {
+        g.pos(i.min(g.n[0] - 1), j.min(g.n[1] - 1), k.min(g.n[2] - 1))
+    };
+
+    let mut pts = Vec::with_capacity(cn[0] * cn[1] * cn[2]);
+    for ck in 0..cn[2] {
+        for cj in 0..cn[1] {
+            for ci in 0..cn[0] {
+                pts.push(g.pos(cnode(ci, 0), cnode(cj, 1), cnode(ck, 2)));
+            }
+        }
+    }
+    let mut coarse = Vec::with_capacity(pts.len());
+    gpu.eval(&pts, &mut coarse).map_err(GpuStop::Failed)?;
+    drop(pts);
+    if mon.cancelled() {
+        return Err(GpuStop::Cancelled);
+    }
+    let cw = |ci: usize, cj: usize, ck: usize| coarse[ci + cn[0] * (cj + cn[1] * ck)];
+    let mut evals = coarse.len();
+
+    struct Bx {
+        at: [usize; 3],
+        w: [f32; 8],
+    }
+    let iso32 = iso as f32;
+    let mut mask = vec![0u8; g.len()];
+    let slab = g.n[0] * g.n[1] * B;
+    let done = AtomicUsize::new(0);
+    let fine = AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
+    let failure: Mutex<Option<String>> = Mutex::new(None);
+    par::chunks_mut(&mut mask, slab, |bk, chunk| {
+        if stop.load(Ordering::Relaxed) || mon.cancelled() {
+            stop.store(true, Ordering::Relaxed);
+            return;
+        }
+        let kbase = bk * B;
+        let mut set = |i: usize, j: usize, k: usize, inside: bool| {
+            if i < g.n[0] && j < g.n[1] && k < g.n[2] {
+                chunk[i + g.n[0] * (j + g.n[1] * (k - kbase))] = inside as u8;
+            }
+        };
+        let mut boxes: Vec<Bx> = Vec::with_capacity(nb[0] * nb[1]);
+        for bj in 0..nb[1] {
+            for bi in 0..nb[0] {
+                let mut w = [0.0; 8];
+                for (c, x) in w.iter_mut().enumerate() {
+                    *x = cw(bi + (c & 1), bj + ((c >> 1) & 1), bk + ((c >> 2) & 1));
+                }
+                boxes.push(Bx {
+                    at: [bi * B, bj * B, bk * B],
+                    w,
+                });
+            }
+        }
+        let mut s = B;
+        let mut pts: Vec<V3> = Vec::new();
+        let mut res: Vec<f32> = Vec::new();
+        let mut split: Vec<Bx> = Vec::new();
+        let mut count = 0;
+        while !boxes.is_empty() {
+            pts.clear();
+            split.clear();
+            for b in boxes.drain(..) {
+                let [i0, j0, k0] = b.at;
+                if i0 >= g.n[0] || j0 >= g.n[1] || k0 >= g.n[2] {
+                    continue;
+                }
+                let ins = b.w.iter().filter(|&&x| x >= iso32).count();
+                let doubtful =
+                    (ins != 0 && ins != 8) || b.w.iter().any(|&x| (x - iso32).abs() < 0.25);
+                let close = || {
+                    let hs = 0.5 * s as f64 * g.h;
+                    let c = g.pos(i0, j0, k0);
+                    let reach = 3f64.sqrt() * hs + near;
+                    bvh.dist2([c[0] + hs, c[1] + hs, c[2] + hs], reach * reach) < reach * reach
+                };
+                if !doubtful && !close() {
+                    for k in k0..k0 + s {
+                        for j in j0..j0 + s {
+                            for i in i0..i0 + s {
+                                set(i, j, k, ins == 8);
+                            }
+                        }
+                    }
+                } else if s == 1 {
+                    set(i0, j0, k0, b.w[0] >= iso32);
+                } else if s == 2 {
+                    for c in 1..8usize {
+                        pts.push(node(i0 + (c & 1), j0 + ((c >> 1) & 1), k0 + ((c >> 2) & 1)));
+                    }
+                    split.push(b);
+                } else {
+                    let h = s / 2;
+                    for c in 0..27usize {
+                        let (a, bb, d) = (c % 3, (c / 3) % 3, c / 9);
+                        if a == 1 || bb == 1 || d == 1 {
+                            pts.push(node(i0 + a * h, j0 + bb * h, k0 + d * h));
+                        }
+                    }
+                    split.push(b);
+                }
+            }
+            if split.is_empty() {
+                break;
+            }
+            res.clear();
+            if let Err(e) = gpu.eval(&pts, &mut res) {
+                *failure.lock().unwrap() = Some(e);
+                stop.store(true, Ordering::Relaxed);
+                return;
+            }
+            count += pts.len();
+            if s == 2 {
+                for (n, b) in split.iter().enumerate() {
+                    let [i0, j0, k0] = b.at;
+                    set(i0, j0, k0, b.w[0] >= iso32);
+                    for c in 1..8usize {
+                        let x = res[n * 7 + c - 1];
+                        set(
+                            i0 + (c & 1),
+                            j0 + ((c >> 1) & 1),
+                            k0 + ((c >> 2) & 1),
+                            x >= iso32,
+                        );
+                    }
+                }
+                break;
+            }
+            let h = s / 2;
+            for (n, b) in split.iter().enumerate() {
+                let [i0, j0, k0] = b.at;
+                let mut l = [0.0f32; 27];
+                let mut next = n * 19;
+                for c in 0..27usize {
+                    let (a, bb, d) = (c % 3, (c / 3) % 3, c / 9);
+                    l[c] = if a != 1 && bb != 1 && d != 1 {
+                        b.w[(a / 2) | ((bb / 2) << 1) | ((d / 2) << 2)]
+                    } else {
+                        next += 1;
+                        res[next - 1]
+                    };
+                }
+                for child in 0..8usize {
+                    let (cx, cy, cz) = (child & 1, (child >> 1) & 1, (child >> 2) & 1);
+                    let mut w = [0.0; 8];
+                    for (c, x) in w.iter_mut().enumerate() {
+                        let (a, bb, d) = (cx + (c & 1), cy + ((c >> 1) & 1), cz + ((c >> 2) & 1));
+                        *x = l[a + 3 * bb + 9 * d];
+                    }
+                    boxes.push(Bx {
+                        at: [i0 + cx * h, j0 + cy * h, k0 + cz * h],
+                        w,
+                    });
+                }
+            }
+            s = h;
+            if mon.cancelled() {
+                stop.store(true, Ordering::Relaxed);
+                return;
+            }
+        }
+        fine.fetch_add(count, Ordering::Relaxed);
+        let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+        mon.progress(d as f32 / nb[2] as f32, "winding number");
+    });
+    if let Some(e) = failure.into_inner().unwrap() {
+        return Err(GpuStop::Failed(e));
+    }
+    if stop.load(Ordering::Relaxed) {
+        return Err(GpuStop::Cancelled);
+    }
+    evals += fine.load(Ordering::Relaxed);
+    clear_border(&mut mask, g);
+    Ok((mask, evals))
+}

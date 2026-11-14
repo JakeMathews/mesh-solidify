@@ -24,7 +24,8 @@
             "target_faces": { "type": "integer", "default": 20000, "minimum": 100, "maximum": 30000, "title": "Triangles", "description": "Output triangle budget (SolidCraft 0.41 accepts about 30,000 from a plugin)." },
             "fair_tau": { "type": "number", "default": 0.5, "minimum": 0, "title": "Patch smoothing", "description": "Vertices farther than this many voxels from the input are hole patches and get smoothed. 0 turns it off." },
             "fair_grow": { "type": "integer", "default": 2, "minimum": 0, "maximum": 10, "title": "Smoothing rings", "description": "Extra rings smoothed around each patch." },
-            "max_voxels": { "type": "integer", "default": 1500000, "minimum": 1000, "maximum": 2000000, "title": "Voxel budget", "description": "Largest grid when Detail is 0. More is finer but slower; SolidCraft 0.41 stops a plugin after a fixed amount of work, about 2,000,000 here." }
+            "max_voxels": { "type": "integer", "default": 1500000, "minimum": 1000, "maximum": 2000000, "title": "Voxel budget", "description": "Largest grid when Detail is 0. More is finer but slower; SolidCraft 0.41 stops a plugin after a fixed amount of work, about 2,000,000 here." },
+            "smooth_fill": { "type": "boolean", "default": false, "title": "Smooth fill", "description": "Fill holes with a smooth, curved surface (for organic shapes). Off: patches span flat between the edges around them and meet them at a crease (for boxy, machined parts)." }
           }
         }
       },

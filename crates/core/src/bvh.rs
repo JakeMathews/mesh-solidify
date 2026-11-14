@@ -29,7 +29,23 @@ pub struct Bvh {
     tris: Vec<[V3; 3]>,
 }
 
+/// A node as the GPU needs it: centre, radius, dipole, first, count.
+#[cfg(feature = "gpu")]
+pub(crate) type RawNode = (V3, f64, V3, u32, u32);
+
 impl Bvh {
+    /// The tree and its triangles in storage order, for the GPU copy.
+    #[cfg(feature = "gpu")]
+    pub(crate) fn raw(&self) -> (Vec<RawNode>, &[[V3; 3]]) {
+        (
+            self.nodes
+                .iter()
+                .map(|n| (n.c, n.r, n.n, n.first, n.count))
+                .collect(),
+            &self.tris,
+        )
+    }
+
     pub fn new(m: &Mesh) -> Bvh {
         let tris: Vec<[V3; 3]> = (0..m.f.len()).map(|i| m.tri(i)).collect();
         let cent: Vec<V3> = tris

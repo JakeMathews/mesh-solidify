@@ -24,3 +24,15 @@ pub fn chunks_mut<T: Send>(v: &mut [T], size: usize, f: impl Fn(usize, &mut [T])
 pub fn chunks_mut<T: Send>(v: &mut [T], size: usize, f: impl Fn(usize, &mut [T]) + Sync + Send) {
     v.chunks_mut(size).enumerate().for_each(|(i, c)| f(i, c));
 }
+
+/// Run `f` for every index below `n`.
+#[cfg(feature = "parallel")]
+pub fn each(n: usize, f: impl Fn(usize) + Sync + Send) {
+    use rayon::prelude::*;
+    (0..n).into_par_iter().for_each(f);
+}
+
+#[cfg(not(feature = "parallel"))]
+pub fn each(n: usize, f: impl Fn(usize) + Sync + Send) {
+    (0..n).for_each(f);
+}
